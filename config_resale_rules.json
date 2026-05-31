@@ -1,0 +1,79 @@
+{
+  "categories": {
+    "dualsense": {
+      "patterns": ["dualsense", "manette ps5", "manette playstation 5"],
+      "label": "Manette PS5 / DualSense",
+      "format": "petit colis",
+      "resale_min": 45,
+      "resale_max": 58,
+      "buy_max": 40,
+      "base_score": 4
+    },
+    "joycon": {
+      "patterns": ["joy-con", "joy con"],
+      "label": "Joy-Con Switch",
+      "format": "petit colis",
+      "resale_min": 45,
+      "resale_max": 65,
+      "buy_max": 35,
+      "base_score": 4
+    },
+    "switch_pro_controller": {
+      "patterns": ["manette switch pro", "switch pro controller"],
+      "label": "Manette Switch Pro",
+      "format": "petit colis",
+      "resale_min": 38,
+      "resale_max": 55,
+      "buy_max": 32,
+      "base_score": 4
+    },
+    "switch_game": {
+      "patterns": ["jeu switch", "jeux switch", "jeu nintendo switch", "cartouche switch", "version physique switch"],
+      "label": "Jeu Switch physique",
+      "format": "jeu physique / petit colis",
+      "resale_min": 28,
+      "resale_max": 42,
+      "buy_max": 22,
+      "base_score": 4
+    },
+    "ps5_game": {
+      "patterns": ["jeu ps5", "jeux ps5", "jeu playstation 5", "ps5 boîte", "ps5 boite", "version physique ps5", "disque ps5"],
+      "label": "Jeu PS5 physique",
+      "format": "jeu physique / petit colis",
+      "resale_min": 20,
+      "resale_max": 32,
+      "buy_max": 15,
+      "base_score": 4
+    },
+    "gaming_headset": {
+      "patterns": ["casque gaming", "pulse 3d", "inzone", "razer", "steelseries", "hyperx", "turtle beach"],
+      "label": "Casque gaming",
+      "format": "colis moyen",
+      "resale_min": 30,
+      "resale_max": 55,
+      "buy_max": 25,
+      "base_score": 3
+    },
+    "switch_microsd": {
+      "patterns": ["microsd switch", "micro sd switch", "carte microsd", "carte micro sd"],
+      "label": "Carte microSD / accessoire Switch",
+      "format": "petit colis",
+      "resale_min": 12,
+      "resale_max": 25,
+      "buy_max": 10,
+      "base_score": 2
+    }
+  },
+  "score": {
+    "urgent_bonus": 3,
+    "trusted_merchant_bonus": 1,
+    "hot_temperature_bonus": 1,
+    "very_hot_temperature_bonus": 2,
+    "good_margin_bonus": 2,
+    "excellent_margin_bonus": 3,
+    "below_buy_max_bonus": 2,
+    "exclusion_penalty": 5,
+    "unknown_price_penalty": 2,
+    "bulky_penalty": 2
+  }
+}
