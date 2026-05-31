@@ -42,7 +42,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1"
+APP_NAME = "Bot Revente Gaming V1.2"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -54,6 +54,9 @@ MIN_SCORE_ALERT = int(os.environ.get("MIN_SCORE_ALERT", "8"))
 MAX_ALERTS_PER_SCAN = int(os.environ.get("MAX_ALERTS_PER_SCAN", "5"))
 MANUAL_INCLUDE_LOW_SCORES = os.environ.get("MANUAL_INCLUDE_LOW_SCORES", "false").lower() == "true"
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
+# V1.2: prix plus stricts pour éviter les faux positifs Dealabs
+STRICT_PRICE_MODE = os.environ.get("STRICT_PRICE_MODE", "true").lower() == "true"
+USE_HTML_FALLBACK = os.environ.get("USE_HTML_FALLBACK", "false").lower() == "true"
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -396,6 +399,45 @@ def extract_price(text: str) -> Tuple[Optional[float], str]:
     return None, "Prix non détecté"
 
 
+
+
+def is_multi_product_or_voucher(title: str) -> bool:
+    """Évite les deals Dealabs trop ambigus : sélections, fidélité, coupons.
+
+    Ces posts mélangent souvent plusieurs prix dans la même carte/page, ce qui
+    provoquait des alertes à 14,99 € ou 0 € alors que le vrai produit était à
+    54,99 € ou juste lié à un avantage fidélité.
+    """
+    norm = normalize_text(title)
+    suspicious = [
+        "selection", "sélection", "ex.:", "ex :", "exemple",
+        "a partir de", "à partir de", "jusqu'a", "jusqu’à",
+        "tous les", "sur tous", "club carrefour", "fidelite", "fidélité",
+        "cashback", "bon d'achat", "coupon", "odr", "prime] console",
+        "console nintendo switch", "console switch", "console ps5",
+    ]
+    return any(x in norm for x in suspicious)
+
+
+def extract_price_strict(title: str, body: str = "") -> Tuple[Optional[float], str]:
+    """V1.2 : on privilégie le prix présent dans le titre ou un bloc prix isolé.
+
+    Ne jamais prendre aveuglément le premier montant trouvé dans toute la carte
+    Dealabs, car elle peut contenir livraison gratuite, commentaires, cashback
+    ou d'autres produits d'une sélection.
+    """
+    title_price, title_text = extract_price(title)
+    if title_price is not None:
+        return title_price, title_text
+
+    # En mode strict, un deal sans prix dans le titre est trop risqué, sauf vrai gratuit explicite.
+    if STRICT_PRICE_MODE:
+        if looks_like_free_product(title):
+            return 0.0, "0 € / gratuit"
+        return None, "Prix non détecté"
+
+    return extract_price(body)
+
 def is_expired_deal_text(text: str) -> bool:
     norm = normalize_text(text)
     expired_terms = [
@@ -465,7 +507,10 @@ def fetch_dealabs_feeds() -> List[Deal]:
                 raw_text = f"{title} {summary}"
                 if is_expired_deal_text(raw_text):
                     continue
-                price, price_text = extract_price(raw_text)
+                if is_multi_product_or_voucher(title):
+                    continue
+                # V1.2: ne prend pas les montants perdus dans le résumé comme prix produit.
+                price, price_text = extract_price_strict(title, raw_text)
                 temperature = extract_temperature(raw_text)
                 merchant = detect_merchant(f"{title} {summary}", load_json_file(KEYWORDS_FILE, DEFAULT_KEYWORDS))
                 image = None
@@ -516,7 +561,21 @@ def parse_deal_card(card: Any, base_url: str = "https://www.dealabs.com") -> Opt
         # Essaie h2/h3
         h = card.find(["h1", "h2", "h3"])
         title = h.get_text(" ", strip=True) if h else text[:120]
-    price, price_text = extract_price(text)
+    if is_multi_product_or_voucher(title):
+        return None
+
+    # Essaye d'abord des blocs prix précis, sinon uniquement le titre.
+    price_node = None
+    for selector in [
+        "[data-t='thread-price']", "[class*='thread-price']",
+        ".thread-price", ".cept-thread-price", "[class*='price']"
+    ]:
+        price_node = card.select_one(selector)
+        if price_node and "€" in price_node.get_text(" ", strip=True):
+            break
+        price_node = None
+    price_source = price_node.get_text(" ", strip=True) if price_node else title
+    price, price_text = extract_price_strict(price_source, text)
     temperature = extract_temperature(text)
     keywords = load_json_file(KEYWORDS_FILE, DEFAULT_KEYWORDS)
     merchant = detect_merchant(text, keywords)
@@ -541,6 +600,9 @@ def fetch_dealabs_search_pages() -> List[Deal]:
     Dealabs peut changer son HTML ou bloquer certains hébergements.
     Cette méthode reste volontairement simple et non agressive.
     """
+    if not USE_HTML_FALLBACK:
+        return []
+
     queries = split_env_list(os.environ.get("DEALABS_SEARCH_QUERIES", ""), DEFAULT_SEARCH_QUERIES)
     session = requests_session()
     deals: List[Deal] = []
@@ -554,9 +616,7 @@ def fetch_dealabs_search_pages() -> List[Deal]:
                 log.warning("Dealabs HTML %s -> HTTP %s", url, resp.status_code)
                 continue
             soup = BeautifulSoup(resp.text, "html.parser")
-            cards = soup.select("article, .thread, [data-t='thread'], [class*='thread']")
-            if not cards:
-                cards = soup.find_all("li")[:80]
+            cards = soup.select("article[data-t='thread'], article.thread, [data-t='thread']")
             for card in cards[:40]:
                 deal = parse_deal_card(card)
                 if deal:
