@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1.6 Recherche ciblée
+Bot Telegram Bons Plans Revente Gaming - V1.7 Prix net réaliste
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -22,6 +22,8 @@ DEALABS_FEEDS=https://www.dealabs.com/rss/hot,https://www.dealabs.com/rss/new
 DEALABS_SEARCH_QUERIES=jeu PS5,jeux PS5,jeu Switch,DualSense,Joy-Con,manette PS5,casque gaming
 SEND_BEST_CANDIDATE_ON_MANUAL_CHECK=true
 CATEGORY_GATE=true
+# V1.7
+PROMO_VALUE_GUARD=true
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.6"
+APP_NAME = "Bot Revente Gaming V1.7"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -69,6 +71,11 @@ SEND_BEST_CANDIDATE_ON_MANUAL_CHECK = os.environ.get("SEND_BEST_CANDIDATE_ON_MAN
 # V1.5: filtre catégorie obligatoire. Même une "erreur de prix" est ignorée
 # si le produit n’est pas dans les cibles gaming/revente définies.
 CATEGORY_GATE = os.environ.get("CATEGORY_GATE", "true").lower() == "true"
+
+# V1.7 : évite de confondre chèque cadeau / cashback / nouveaux clients
+# avec le vrai prix payé. Ces deals restent visibles en jaune, sans marge inventée.
+PROMO_VALUE_GUARD = os.environ.get("PROMO_VALUE_GUARD", "true").lower() == "true"
+CONDITIONAL_PRICE_PENALTY = int(os.environ.get("CONDITIONAL_PRICE_PENALTY", "2"))
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -399,9 +406,12 @@ def extract_price(text: str) -> Tuple[Optional[float], str]:
     # Ignore les montants qui ne sont pas des prix produits.
     ignored_context_words = [
         "fidélité", "fidelite", "cashback", "bon d'achat", "bon achat",
+        "chèque cadeau", "cheque cadeau", "chèque-cadeau", "cheque-cadeau",
+        "offert en chèque", "offerts en chèque", "offert en cheque", "offerts en cheque",
         "odr", "rembourse", "remboursé", "remboursee", "coupon",
         "livraison", "frais de port", "fdp", "retrait", "retour",
         "économie", "economie", "remise", "réduction", "reduction",
+        "nouveau client", "nouveaux clients", "première commande", "premiere commande",
     ]
 
     matches = list(re.finditer(r"(\d{1,4}(?:[\s\.]\d{3})*(?:[,.]\d{1,2})?)\s*€", text))
@@ -450,6 +460,38 @@ def is_multi_product_or_voucher(title: str) -> bool:
 
 
 
+def promo_value_reasons(title: str, body: str = "") -> List[str]:
+    """V1.7 : repère les montants qui sont des avantages, pas le prix payé.
+
+    Exemples : "+10€ en chèque cadeau", "10€ offerts", "5€ fidélité",
+    "39,99€ pour les nouveaux clients". Ces deals peuvent être utiles,
+    mais ne doivent jamais être classés comme prix fiable avec marge calculée.
+    """
+    text = normalize_text(f"{title} {body}")
+    checks = [
+        ("Avantage chèque cadeau / bon d'achat : montant à ne pas lire comme prix payé", [
+            "chèque cadeau", "cheque cadeau", "chèque-cadeau", "cheque-cadeau",
+            "bon d'achat", "bon achat", "offert en chèque", "offerts en chèque",
+            "offert en cheque", "offerts en cheque", "en chèque c", "en cheque c",
+        ]),
+        ("Avantage fidélité / cagnotte : prix net réel à vérifier", [
+            "fidélité", "fidelite", "club carrefour", "cagnotte", "cagnotté", "cagnotte",
+        ]),
+        ("Cashback / ODR / coupon : avantage non garanti immédiatement", [
+            "cashback", "odr", "offre de remboursement", "coupon", "code promo", "code réduction", "code reduction",
+        ]),
+        ("Prix réservé aux nouveaux clients : condition d'éligibilité à vérifier", [
+            "nouveau client", "nouveaux clients", "nouvelle cliente", "nouveaux comptes",
+            "première commande", "premiere commande", "1ere commande", "1ère commande",
+        ]),
+    ]
+    reasons: List[str] = []
+    for label, terms in checks:
+        if any(t in text for t in terms):
+            reasons.append(label)
+    return reasons
+
+
 def price_uncertainty_reasons(title: str, body: str = "") -> List[str]:
     """Repère les deals où le montant Dealabs peut être un exemple, une sélection,
     un coupon, de la fidélité ou un prix annexe. Ces deals peuvent rester utiles,
@@ -460,7 +502,8 @@ def price_uncertainty_reasons(title: str, body: str = "") -> List[str]:
         ("Deal de type sélection / plusieurs produits", ["selection", "sélection", "tous les", "sur tous", "lot de", "plusieurs"]),
         ("Prix possiblement donné comme exemple", ["ex.:", "ex :", "exemple", "par exemple"]),
         ("Prix possiblement à partir de", ["a partir de", "à partir de", "dès", "des "]),
-        ("Avantage fidélité/coupon/cashback possible", ["fidelite", "fidélité", "club carrefour", "coupon", "cashback", "odr", "bon d'achat", "bon achat"]),
+        ("Avantage fidélité/coupon/cashback possible", ["fidelite", "fidélité", "club carrefour", "coupon", "cashback", "odr", "bon d'achat", "bon achat", "chèque cadeau", "cheque cadeau", "offert en chèque", "offerts en chèque"]),
+        ("Prix conditionnel / nouveaux clients à vérifier", ["nouveau client", "nouveaux clients", "première commande", "premiere commande", "1ere commande", "1ère commande"]),
         ("Console ou pack trop large à vérifier", ["console nintendo switch", "console switch", "console ps5", "pack console", "bundle console"]),
     ]
     reasons: List[str] = []
@@ -559,6 +602,8 @@ def fetch_dealabs_feeds() -> List[Deal]:
                     continue
                 # V1.3: on ne supprime plus les sélections : on les déclare incertaines.
                 uncertainty = price_uncertainty_reasons(title, raw_text)
+                if PROMO_VALUE_GUARD:
+                    uncertainty.extend([r for r in promo_value_reasons(title, raw_text) if r not in uncertainty])
                 price_reliable = not uncertainty
                 price, price_text = extract_price_strict(title, raw_text)
                 if not price_reliable and price is not None:
@@ -616,6 +661,8 @@ def parse_deal_card(card: Any, base_url: str = "https://www.dealabs.com") -> Opt
         h = card.find(["h1", "h2", "h3"])
         title = h.get_text(" ", strip=True) if h else text[:120]
     uncertainty = price_uncertainty_reasons(title, text)
+    if PROMO_VALUE_GUARD:
+        uncertainty.extend([r for r in promo_value_reasons(title, text) if r not in uncertainty])
     price_reliable = not uncertainty
 
     # Essaye d'abord des blocs prix précis, sinon uniquement le titre.
@@ -728,6 +775,12 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
         return None
 
     uncertain_reasons = deal.uncertainty_reasons or []
+    promo_reasons = promo_value_reasons(deal.title, deal.description) if PROMO_VALUE_GUARD else []
+    if promo_reasons:
+        for reason in promo_reasons:
+            if reason not in uncertain_reasons:
+                uncertain_reasons.append(reason)
+        deal.price_reliable = False
 
     # Prix absent : inutile sauf signal urgent ou deal ambigu très ciblé qu'on envoie en jaune.
     if deal.price is None and not (urgent or (SEND_UNCERTAIN_DEALS and category_rule and uncertain_reasons)):
@@ -762,8 +815,14 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
         reasons.append(f"Signal urgent : {urgent}")
 
     if uncertain_reasons or not deal.price_reliable:
-        score -= 1
-        reasons.extend(uncertain_reasons[:2])
+        # V1.7 : les chèques cadeaux/cashback/nouveaux clients peuvent être utiles,
+        # mais ils ne doivent pas produire un score "fiable" ni une marge inventée.
+        penalty = CONDITIONAL_PRICE_PENALTY if any(
+            any(key in normalize_text(r) for key in ["chèque", "cheque", "fidélité", "fidelite", "cashback", "coupon", "nouveau", "odr"])
+            for r in uncertain_reasons
+        ) else 1
+        score -= penalty
+        reasons.extend(uncertain_reasons[:3])
 
     trusted = any_keyword(norm, keywords.get("trusted_merchants", []))
     if trusted or deal.merchant != "Marchand à vérifier":
@@ -850,10 +909,14 @@ def build_message(deal: Deal, analysis: Analysis) -> str:
     temp = f"\n🌡️ Température Dealabs : <b>{deal.temperature:.0f}°</b>" if deal.temperature is not None else ""
     reasons = "\n".join(f"• {html.escape(r)}" for r in analysis.reasons)
     if analysis.price_reliable:
-        price_line = f"💸 Prix détecté : <b>{html.escape(deal.price_text)}</b>\n"
+        price_line = f"💸 Prix payé détecté : <b>{html.escape(deal.price_text)}</b>\n"
         margin_line = f"🧮 Marge brute estimée : <b>{html.escape(format_range(analysis.margin_min, analysis.margin_max))}</b>"
+        if analysis.margin_min is not None and analysis.margin_max is not None:
+            prudent_min = max(0, analysis.margin_min - 4)
+            prudent_max = max(0, analysis.margin_max - 6)
+            margin_line += f"\n🧯 Marge prudente estimée : <b>{html.escape(format_range(prudent_min, prudent_max))}</b>"
     else:
-        price_line = f"💸 Prix : <b>à vérifier</b>\n💬 Montant repéré : <b>{html.escape(deal.price_text)}</b>\n"
+        price_line = f"💸 Prix payé réel : <b>à vérifier</b>\n💬 Montant repéré : <b>{html.escape(deal.price_text)}</b>\n"
         margin_line = "🧮 Marge brute estimée : <b>non calculée tant que le prix exact n'est pas confirmé</b>"
     return (
         f"{analysis.alert_type}\n\n"
@@ -989,7 +1052,8 @@ def build_debug_message(stats: Dict[str, Any]) -> str:
         "🔎 <b>Diagnostic Dealabs</b>\n\n"
         f"<b>Sources RSS :</b>\n{feeds_text}\n"
         f"HTML fallback : <b>{USE_HTML_FALLBACK}</b>\n"
-        f"Mode prix strict : <b>{STRICT_PRICE_MODE}</b>\n\n"
+        f"Mode prix strict : <b>{STRICT_PRICE_MODE}</b>\n"
+        f"Protection chèques/cashback/nouveaux clients : <b>{PROMO_VALUE_GUARD}</b>\n\n"
         f"Deals RSS récupérés : <b>{stats.get('raw_from_rss', 0)}</b>\n"
         f"Deals HTML récupérés : <b>{stats.get('raw_from_html', 0)}</b>\n"
         f"Deals bruts : <b>{stats.get('raw_total', 0)}</b>\n"
