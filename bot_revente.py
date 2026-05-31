@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1.5 Category Gate
+Bot Telegram Bons Plans Revente Gaming - V1.6 Recherche ciblée
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -46,7 +46,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.5"
+APP_NAME = "Bot Revente Gaming V1.6"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -60,7 +60,7 @@ MANUAL_INCLUDE_LOW_SCORES = os.environ.get("MANUAL_INCLUDE_LOW_SCORES", "false")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
 # V1.2: prix plus stricts pour éviter les faux positifs Dealabs
 STRICT_PRICE_MODE = os.environ.get("STRICT_PRICE_MODE", "true").lower() == "true"
-USE_HTML_FALLBACK = os.environ.get("USE_HTML_FALLBACK", "false").lower() == "true"
+USE_HTML_FALLBACK = os.environ.get("USE_HTML_FALLBACK", "true").lower() == "true"
 # V1.3: on envoie aussi certains deals ambigus en alerte jaune, sans inventer de marge.
 SEND_UNCERTAIN_DEALS = os.environ.get("SEND_UNCERTAIN_DEALS", "true").lower() == "true"
 MIN_SCORE_UNCERTAIN = int(os.environ.get("MIN_SCORE_UNCERTAIN", "7"))
@@ -75,19 +75,34 @@ DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/new",
 ]
 DEFAULT_SEARCH_QUERIES = [
+    # Jeux physiques PS5 / Switch
     "jeu PS5",
     "jeux PS5",
     "PS5 boite",
     "version physique PS5",
+    "jeu PlayStation 5",
+    "Final Fantasy XVI PS5",
+    "Spider-Man 2 PS5",
+    "God of War Ragnarok PS5",
+    "Resident Evil PS5",
     "jeu Nintendo Switch",
     "jeux Switch",
     "cartouche Switch",
+    "version physique Switch",
+    "Mario Kart Switch",
+    "Zelda Switch",
+    "Pokemon Switch",
+    # Manettes / accessoires
     "DualSense",
     "manette PS5",
+    "manette sans fil DualSense",
     "Joy-Con",
+    "Joy-Con 2",
     "manette Switch Pro",
+    "Pro Controller Switch",
     "casque gaming",
     "Pulse 3D",
+    "microSD Switch",
 ]
 
 USER_AGENT = (
@@ -222,7 +237,7 @@ DEFAULT_KEYWORDS = {
 DEFAULT_RULES = {
     "categories": {
         "dualsense": {
-            "patterns": ["dualsense", "manette ps5", "manette playstation 5"],
+            "patterns": ["dualsense", "dual sense", "manette ps5", "manette playstation 5", "manette sans fil dualsense", "manette sans fil ps5", "selection de manette ps5", "sélection de manette ps5"],
             "label": "Manette PS5 / DualSense",
             "format": "petit colis",
             "resale_min": 45,
@@ -231,7 +246,7 @@ DEFAULT_RULES = {
             "base_score": 4,
         },
         "joycon": {
-            "patterns": ["joy-con", "joy con"],
+            "patterns": ["joy-con", "joy con", "joy-con 2", "joy con 2", "volant joy-con", "volants joy-con"],
             "label": "Joy-Con Switch",
             "format": "petit colis",
             "resale_min": 45,
@@ -240,7 +255,7 @@ DEFAULT_RULES = {
             "base_score": 4,
         },
         "switch_pro_controller": {
-            "patterns": ["manette switch pro", "switch pro controller"],
+            "patterns": ["manette switch pro", "switch pro controller", "pro controller", "manette pro controller"],
             "label": "Manette Switch Pro",
             "format": "petit colis",
             "resale_min": 38,
@@ -249,7 +264,7 @@ DEFAULT_RULES = {
             "base_score": 4,
         },
         "switch_game": {
-            "patterns": ["jeu switch", "jeux switch", "jeu nintendo switch", "cartouche switch", "version physique switch"],
+            "patterns": ["jeu switch", "jeux switch", "jeu nintendo switch", "cartouche switch", "version physique switch", "mario kart", "zelda switch", "pokemon switch", "pokémon switch", "super mario", "donkey kong", "kirby", "animal crossing", "metroid", "splatoon"],
             "label": "Jeu Switch physique",
             "format": "jeu physique / petit colis",
             "resale_min": 28,
@@ -258,7 +273,7 @@ DEFAULT_RULES = {
             "base_score": 4,
         },
         "ps5_game": {
-            "patterns": ["jeu ps5", "jeux ps5", "jeu playstation 5", "ps5 boîte", "ps5 boite", "version physique ps5", "disque ps5"],
+            "patterns": ["jeu ps5", "jeux ps5", "jeu playstation 5", "ps5 boîte", "ps5 boite", "version physique ps5", "disque ps5", "final fantasy", "spider-man", "spiderman", "resident evil", "astro bot", "stellar blade", "god of war", "gran turismo", "silent hill", "call of duty ps5"],
             "label": "Jeu PS5 physique",
             "format": "jeu physique / petit colis",
             "resale_min": 20,
@@ -267,7 +282,7 @@ DEFAULT_RULES = {
             "base_score": 4,
         },
         "gaming_headset": {
-            "patterns": ["casque gaming", "pulse 3d", "inzone", "razer", "steelseries", "hyperx", "turtle beach"],
+            "patterns": ["casque gaming", "casque gamer", "pulse 3d", "inzone", "razer", "logitech g", "steelseries", "hyperx", "turtle beach"],
             "label": "Casque gaming",
             "format": "colis moyen",
             "resale_min": 30,
