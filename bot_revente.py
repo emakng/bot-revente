@@ -52,6 +52,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
 MIN_SCORE_ALERT = int(os.environ.get("MIN_SCORE_ALERT", "8"))
 MAX_ALERTS_PER_SCAN = int(os.environ.get("MAX_ALERTS_PER_SCAN", "5"))
+MANUAL_INCLUDE_LOW_SCORES = os.environ.get("MANUAL_INCLUDE_LOW_SCORES", "false").lower() == "true"
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
 
 DEFAULT_DEALABS_FEEDS = [
@@ -191,6 +192,12 @@ DEFAULT_KEYWORDS = {
         "pc uniquement",
         "téléchargement",
         "telechargement",
+        "console nintendo switch",
+        "console switch",
+        "console ps5",
+        "playstation 5 slim",
+        "pack console",
+        "bundle console",
     ],
 }
 
@@ -330,22 +337,73 @@ def any_keyword(text: str, keywords: Iterable[str]) -> Optional[str]:
     return None
 
 
+def looks_like_free_product(text: str) -> bool:
+    """Retourne True seulement si gratuit concerne probablement le produit.
+
+    Ancienne erreur : le bot voyait "livraison gratuite" ou "retour gratuit"
+    et transformait le deal en prix 0 €.
+    """
+    lower = normalize_text(text)
+    bad_contexts = [
+        "livraison gratuite", "frais de port gratuit", "frais de port gratuits",
+        "fdp gratuit", "fdp gratuits", "retour gratuit", "retours gratuits",
+        "expédition gratuite", "expedition gratuite", "retrait gratuit",
+    ]
+    cleaned = lower
+    for bad in bad_contexts:
+        cleaned = cleaned.replace(bad, " ")
+
+    # Gratuit doit apparaître comme information produit, pas seulement logistique.
+    return bool(re.search(r"\b(gratuit|offert|free)\b", cleaned))
+
+
 def extract_price(text: str) -> Tuple[Optional[float], str]:
     if not text:
         return None, "Prix non détecté"
-    # Dealabs utilise parfois 14,99€, 14.99 €, Gratuit, 0€
-    lower = text.lower()
-    if any(x in lower for x in ["gratuit", "free", "0€", "0 €"]):
-        return 0.0, "0 € / gratuit"
-    matches = re.findall(r"(\d{1,4}(?:[\s\.]\d{3})*(?:[,.]\d{1,2})?)\s*€", text)
-    if not matches:
-        return None, "Prix non détecté"
-    raw = matches[0].replace(" ", "").replace(".", "").replace(",", ".")
-    try:
-        value = float(raw)
+
+    lower = normalize_text(text)
+
+    # Ignore les montants qui ne sont pas des prix produits.
+    ignored_context_words = [
+        "fidélité", "fidelite", "cashback", "bon d'achat", "bon achat",
+        "odr", "rembourse", "remboursé", "remboursee", "coupon",
+        "livraison", "frais de port", "fdp", "retrait", "retour",
+        "économie", "economie", "remise", "réduction", "reduction",
+    ]
+
+    matches = list(re.finditer(r"(\d{1,4}(?:[\s\.]\d{3})*(?:[,.]\d{1,2})?)\s*€", text))
+    candidates: List[float] = []
+    for m in matches:
+        start, end = m.span()
+        context = normalize_text(text[max(0, start - 45): min(len(text), end + 45)])
+        if any(word in context for word in ignored_context_words):
+            continue
+        raw = m.group(1).replace(" ", "").replace(".", "").replace(",", ".")
+        try:
+            candidates.append(float(raw))
+        except ValueError:
+            pass
+
+    if candidates:
+        # Sur Dealabs, le vrai prix est généralement le premier montant € utile.
+        value = candidates[0]
         return value, f"{value:.2f} €".replace(".", ",")
-    except ValueError:
-        return None, "Prix non détecté"
+
+    # Produit réellement gratuit uniquement si le mot gratuit ne concerne pas la livraison.
+    if looks_like_free_product(text) or re.search(r"\b0\s*€\b", lower):
+        return 0.0, "0 € / gratuit"
+
+    return None, "Prix non détecté"
+
+
+def is_expired_deal_text(text: str) -> bool:
+    norm = normalize_text(text)
+    expired_terms = [
+        "expiré", "expire", "expirée", "expiree", "deal expiré", "deal expire",
+        "terminé", "termine", "ce deal a expiré", "ce deal a expire",
+        "plus disponible", "indisponible", "rupture de stock", "stock épuisé", "stock epuise",
+    ]
+    return any(term in norm for term in expired_terms)
 
 
 def extract_temperature(text: str) -> Optional[float]:
@@ -404,8 +462,11 @@ def fetch_dealabs_feeds() -> List[Deal]:
                 title = html.unescape(getattr(entry, "title", "")).strip()
                 url = clean_dealabs_url(getattr(entry, "link", ""))
                 summary = html.unescape(getattr(entry, "summary", "") or getattr(entry, "description", ""))
-                price, price_text = extract_price(f"{title} {summary}")
-                temperature = extract_temperature(f"{title} {summary}")
+                raw_text = f"{title} {summary}"
+                if is_expired_deal_text(raw_text):
+                    continue
+                price, price_text = extract_price(raw_text)
+                temperature = extract_temperature(raw_text)
                 merchant = detect_merchant(f"{title} {summary}", load_json_file(KEYWORDS_FILE, DEFAULT_KEYWORDS))
                 image = None
                 if getattr(entry, "media_content", None):
@@ -429,6 +490,8 @@ def fetch_dealabs_feeds() -> List[Deal]:
 def parse_deal_card(card: Any, base_url: str = "https://www.dealabs.com") -> Optional[Deal]:
     text = card.get_text(" ", strip=True)
     if len(text) < 10:
+        return None
+    if is_expired_deal_text(text):
         return None
 
     link_tag = None
@@ -529,12 +592,24 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
     full_text = f"{deal.title} {deal.description} {deal.merchant}"
     norm = normalize_text(full_text)
 
+    if is_expired_deal_text(full_text):
+        return None
+
     exclusion = any_keyword(norm, keywords.get("exclusions", []))
     urgent = any_keyword(norm, keywords.get("urgent", []))
     category_rule = category_for_deal(deal, rules)
 
     # Si aucun produit cible et pas d'urgence, on ignore.
     if not category_rule and not urgent:
+        return None
+
+    # Pour de la revente, un deal sans prix fiable est inutile et génère trop de faux positifs.
+    if deal.price is None:
+        return None
+
+    # Sécurité anti-faux 0€ : si le prix est 0 mais que le titre ne dit pas clairement
+    # que le produit est gratuit/offert, on ignore. Sinon c'est souvent "livraison gratuite".
+    if deal.price == 0 and not looks_like_free_product(deal.title):
         return None
 
     score_cfg = rules.get("score", {})
@@ -717,7 +792,7 @@ async def run_scan_and_alert(application: Application, manual_chat_id: Optional[
 
     seen = set(state.get("seen_deals", []))
     try:
-        results = scan_once(include_low_scores=manual_chat_id is not None)
+        results = scan_once(include_low_scores=(manual_chat_id is not None and MANUAL_INCLUDE_LOW_SCORES))
         state["last_scan"] = datetime.now(timezone.utc).isoformat()
         state["last_error"] = None
     except Exception as exc:
@@ -732,7 +807,7 @@ async def run_scan_and_alert(application: Application, manual_chat_id: Optional[
     for deal, analysis in results:
         if manual_chat_id is None and deal.id in seen:
             continue
-        if manual_chat_id is None and analysis.score < MIN_SCORE_ALERT:
+        if analysis.score < MIN_SCORE_ALERT and not MANUAL_INCLUDE_LOW_SCORES:
             continue
         new_results.append((deal, analysis))
 
@@ -806,6 +881,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Abonnés : {len(state.get('subscribers', []))}\n"
         f"Intervalle scan : {CHECK_INTERVAL_SECONDS} sec\n"
         f"Score minimum alerte : {MIN_SCORE_ALERT}/10\n"
+        f"Scan manuel élargi : {MANUAL_INCLUDE_LOW_SCORES}\n"
         f"Dernier scan : {state.get('last_scan') or 'aucun'}\n"
         f"Dernière erreur : {state.get('last_error') or 'aucune'}"
     )
