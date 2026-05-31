@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1.4 Diagnostic
+Bot Telegram Bons Plans Revente Gaming - V1.5 Category Gate
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -21,6 +21,7 @@ MIN_SCORE_UNCERTAIN=7
 DEALABS_FEEDS=https://www.dealabs.com/rss/hot,https://www.dealabs.com/rss/new
 DEALABS_SEARCH_QUERIES=jeu PS5,jeux PS5,jeu Switch,DualSense,Joy-Con,manette PS5,casque gaming
 SEND_BEST_CANDIDATE_ON_MANUAL_CHECK=true
+CATEGORY_GATE=true
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.4"
+APP_NAME = "Bot Revente Gaming V1.5"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -64,6 +65,10 @@ USE_HTML_FALLBACK = os.environ.get("USE_HTML_FALLBACK", "false").lower() == "tru
 SEND_UNCERTAIN_DEALS = os.environ.get("SEND_UNCERTAIN_DEALS", "true").lower() == "true"
 MIN_SCORE_UNCERTAIN = int(os.environ.get("MIN_SCORE_UNCERTAIN", "7"))
 SEND_BEST_CANDIDATE_ON_MANUAL_CHECK = os.environ.get("SEND_BEST_CANDIDATE_ON_MANUAL_CHECK", "true").lower() == "true"
+
+# V1.5: filtre catégorie obligatoire. Même une "erreur de prix" est ignorée
+# si le produit n’est pas dans les cibles gaming/revente définies.
+CATEGORY_GATE = os.environ.get("CATEGORY_GATE", "true").lower() == "true"
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -697,7 +702,13 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
     urgent = any_keyword(norm, keywords.get("urgent", []))
     category_rule = category_for_deal(deal, rules)
 
-    # Si aucun produit cible et pas d'urgence, on ignore.
+    # V1.5 : filtre catégorie obligatoire.
+    # On ne veut plus d'alertes TV, lingettes, coussins, électroménager, etc.
+    # Même si Dealabs parle d'erreur de prix, le deal doit matcher une catégorie cible.
+    if CATEGORY_GATE and not category_rule:
+        return None
+
+    # Mode legacy possible : si CATEGORY_GATE=false, on peut encore remonter les urgences hors catégorie.
     if not category_rule and not urgent:
         return None
 
@@ -865,6 +876,7 @@ def scan_detailed(include_low_scores: bool = False) -> Tuple[List[Tuple[Deal, An
         "unique_total": 0,
         "expired_ignored": 0,
         "no_category_ignored": 0,
+        "urgent_outside_category_ignored": 0,
         "no_price_ignored": 0,
         "exclusion_detected": 0,
         "uncertain_price": 0,
@@ -914,6 +926,11 @@ def scan_detailed(include_low_scores: bool = False) -> Tuple[List[Tuple[Deal, An
 
         has_category = category_for_deal(deal, rules) is not None
         urgent = any_keyword(norm, keywords.get("urgent", [])) is not None
+        if CATEGORY_GATE and not has_category:
+            stats["no_category_ignored"] += 1
+            if urgent:
+                stats["urgent_outside_category_ignored"] += 1
+            continue
         if not has_category and not urgent:
             stats["no_category_ignored"] += 1
             continue
@@ -1162,7 +1179,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/check — scanner maintenant\n"
         "/status — voir l'état\n"
         "/stop_revente — arrêter les alertes\n\n"
-        "V1 = Dealabs uniquement. Keepa/Amazon et Vinted pourront être ajoutés ensuite."
+        "V1.5 = Dealabs uniquement avec filtre catégorie obligatoire. Keepa/Amazon et Vinted pourront être ajoutés ensuite."
     )
 
 
