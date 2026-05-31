@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1 Dealabs
+Bot Telegram Bons Plans Revente Gaming - V1.4 Diagnostic
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -20,6 +20,7 @@ SEND_UNCERTAIN_DEALS=true
 MIN_SCORE_UNCERTAIN=7
 DEALABS_FEEDS=https://www.dealabs.com/rss/hot,https://www.dealabs.com/rss/new
 DEALABS_SEARCH_QUERIES=jeu PS5,jeux PS5,jeu Switch,DualSense,Joy-Con,manette PS5,casque gaming
+SEND_BEST_CANDIDATE_ON_MANUAL_CHECK=true
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.3"
+APP_NAME = "Bot Revente Gaming V1.4"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -62,6 +63,7 @@ USE_HTML_FALLBACK = os.environ.get("USE_HTML_FALLBACK", "false").lower() == "tru
 # V1.3: on envoie aussi certains deals ambigus en alerte jaune, sans inventer de marge.
 SEND_UNCERTAIN_DEALS = os.environ.get("SEND_UNCERTAIN_DEALS", "true").lower() == "true"
 MIN_SCORE_UNCERTAIN = int(os.environ.get("MIN_SCORE_UNCERTAIN", "7"))
+SEND_BEST_CANDIDATE_ON_MANUAL_CHECK = os.environ.get("SEND_BEST_CANDIDATE_ON_MANUAL_CHECK", "true").lower() == "true"
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -843,26 +845,134 @@ def build_message(deal: Deal, analysis: Analysis) -> str:
     )
 
 
-def scan_once(include_low_scores: bool = False) -> List[Tuple[Deal, Analysis]]:
+def passes_alert_threshold(analysis: Analysis) -> bool:
+    reliable_ok = analysis.price_reliable and analysis.score >= MIN_SCORE_ALERT
+    uncertain_ok = SEND_UNCERTAIN_DEALS and not analysis.price_reliable and analysis.score >= MIN_SCORE_UNCERTAIN
+    return bool(reliable_ok or uncertain_ok)
+
+
+def scan_detailed(include_low_scores: bool = False) -> Tuple[List[Tuple[Deal, Analysis]], Dict[str, Any]]:
+    """Scan avec statistiques détaillées pour régler le bot."""
     ensure_config_files()
     keywords = load_json_file(KEYWORDS_FILE, DEFAULT_KEYWORDS)
     rules = load_json_file(RULES_FILE, DEFAULT_RULES)
 
-    deals = []
-    deals.extend(fetch_dealabs_feeds())
-    deals.extend(fetch_dealabs_search_pages())
-    deals = dedupe_deals(deals)
+    stats: Dict[str, Any] = {
+        "feeds_configured": split_env_list(os.environ.get("DEALABS_FEEDS", ""), DEFAULT_DEALABS_FEEDS),
+        "raw_from_rss": 0,
+        "raw_from_html": 0,
+        "raw_total": 0,
+        "unique_total": 0,
+        "expired_ignored": 0,
+        "no_category_ignored": 0,
+        "no_price_ignored": 0,
+        "exclusion_detected": 0,
+        "uncertain_price": 0,
+        "analyzed_total": 0,
+        "eligible_total": 0,
+        "reliable_alerts": 0,
+        "uncertain_alerts": 0,
+        "best_score": None,
+        "best_title": None,
+        "last_error": None,
+    }
 
-    results: List[Tuple[Deal, Analysis]] = []
+    raw_deals: List[Deal] = []
+    try:
+        rss_deals = fetch_dealabs_feeds()
+        stats["raw_from_rss"] = len(rss_deals)
+        raw_deals.extend(rss_deals)
+    except Exception as exc:
+        stats["last_error"] = f"RSS: {exc}"
+        log.exception("Erreur RSS dans scan_detailed")
+
+    try:
+        html_deals = fetch_dealabs_search_pages()
+        stats["raw_from_html"] = len(html_deals)
+        raw_deals.extend(html_deals)
+    except Exception as exc:
+        stats["last_error"] = f"HTML: {exc}"
+        log.exception("Erreur HTML dans scan_detailed")
+
+    stats["raw_total"] = len(raw_deals)
+    deals = dedupe_deals(raw_deals)
+    stats["unique_total"] = len(deals)
+
+    all_results: List[Tuple[Deal, Analysis]] = []
+    eligible_results: List[Tuple[Deal, Analysis]] = []
+
     for deal in deals:
+        full_text = f"{deal.title} {deal.description} {deal.merchant}"
+        norm = normalize_text(full_text)
+        if is_expired_deal_text(full_text):
+            stats["expired_ignored"] += 1
+            continue
+        if any_keyword(norm, keywords.get("exclusions", [])):
+            stats["exclusion_detected"] += 1
+        if deal.uncertainty_reasons or not deal.price_reliable:
+            stats["uncertain_price"] += 1
+
+        has_category = category_for_deal(deal, rules) is not None
+        urgent = any_keyword(norm, keywords.get("urgent", [])) is not None
+        if not has_category and not urgent:
+            stats["no_category_ignored"] += 1
+            continue
+        if deal.price is None and not (urgent or (SEND_UNCERTAIN_DEALS and has_category and (deal.uncertainty_reasons or []))):
+            stats["no_price_ignored"] += 1
+
         analysis = analyze_deal(deal, keywords, rules)
         if not analysis:
             continue
-        if include_low_scores or analysis.score >= MIN_SCORE_ALERT or (SEND_UNCERTAIN_DEALS and not analysis.price_reliable and analysis.score >= MIN_SCORE_UNCERTAIN):
-            results.append((deal, analysis))
+        stats["analyzed_total"] += 1
+        all_results.append((deal, analysis))
+        if stats["best_score"] is None or analysis.score > stats["best_score"]:
+            stats["best_score"] = analysis.score
+            stats["best_title"] = deal.title[:120]
 
-    results.sort(key=lambda x: (x[1].score, x[0].temperature or 0), reverse=True)
+        if passes_alert_threshold(analysis):
+            stats["eligible_total"] += 1
+            if analysis.price_reliable:
+                stats["reliable_alerts"] += 1
+            else:
+                stats["uncertain_alerts"] += 1
+            eligible_results.append((deal, analysis))
+
+    all_results.sort(key=lambda x: (x[1].score, x[0].temperature or 0), reverse=True)
+    eligible_results.sort(key=lambda x: (x[1].score, x[0].temperature or 0), reverse=True)
+    return (all_results if include_low_scores else eligible_results), stats
+
+
+def scan_once(include_low_scores: bool = False) -> List[Tuple[Deal, Analysis]]:
+    results, _ = scan_detailed(include_low_scores=include_low_scores)
     return results
+
+
+def build_debug_message(stats: Dict[str, Any]) -> str:
+    feeds = stats.get("feeds_configured") or []
+    feeds_text = "\n".join(f"• {html.escape(str(f))}" for f in feeds[:5]) or "• aucun"
+    best_score = stats.get("best_score")
+    best_title = stats.get("best_title") or "aucun"
+    best_line = f"{html.escape(str(best_title))} — score {best_score}/10" if best_score is not None else "aucun"
+    return (
+        "🔎 <b>Diagnostic Dealabs</b>\n\n"
+        f"<b>Sources RSS :</b>\n{feeds_text}\n"
+        f"HTML fallback : <b>{USE_HTML_FALLBACK}</b>\n"
+        f"Mode prix strict : <b>{STRICT_PRICE_MODE}</b>\n\n"
+        f"Deals RSS récupérés : <b>{stats.get('raw_from_rss', 0)}</b>\n"
+        f"Deals HTML récupérés : <b>{stats.get('raw_from_html', 0)}</b>\n"
+        f"Deals bruts : <b>{stats.get('raw_total', 0)}</b>\n"
+        f"Deals uniques : <b>{stats.get('unique_total', 0)}</b>\n\n"
+        f"Analysés : <b>{stats.get('analyzed_total', 0)}</b>\n"
+        f"Éligibles alerte : <b>{stats.get('eligible_total', 0)}</b>\n"
+        f"Alertes fiables : <b>{stats.get('reliable_alerts', 0)}</b>\n"
+        f"Alertes jaunes : <b>{stats.get('uncertain_alerts', 0)}</b>\n\n"
+        f"Ignorés hors cible : <b>{stats.get('no_category_ignored', 0)}</b>\n"
+        f"Ignorés prix absent : <b>{stats.get('no_price_ignored', 0)}</b>\n"
+        f"Prix incertains repérés : <b>{stats.get('uncertain_price', 0)}</b>\n"
+        f"Exclusions repérées : <b>{stats.get('exclusion_detected', 0)}</b>\n\n"
+        f"Meilleur candidat : <b>{best_line}</b>\n"
+        f"Dernière erreur : <b>{html.escape(str(stats.get('last_error') or 'aucune'))}</b>"
+    )
 
 
 class HealthCheckServer(BaseHTTPRequestHandler):
@@ -905,9 +1015,9 @@ async def run_scan_and_alert(application: Application, manual_chat_id: Optional[
 
     seen = set(state.get("seen_deals", []))
     try:
-        results = scan_once(include_low_scores=(manual_chat_id is not None and MANUAL_INCLUDE_LOW_SCORES))
+        results, stats = scan_detailed(include_low_scores=(manual_chat_id is not None and MANUAL_INCLUDE_LOW_SCORES))
         state["last_scan"] = datetime.now(timezone.utc).isoformat()
-        state["last_error"] = None
+        state["last_error"] = stats.get("last_error")
     except Exception as exc:
         log.exception("Erreur scan")
         state["last_error"] = str(exc)
@@ -983,10 +1093,50 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔎 Scan manuel lancé...")
     total, sent = await run_scan_and_alert(context.application, manual_chat_id=update.effective_chat.id)
     if sent == 0:
-        await update.message.reply_text(
-            f"Aucune opportunité vraiment intéressante trouvée pour l'instant.\n"
-            f"Deals analysés/filtrés : {total}."
+        candidates, stats = scan_detailed(include_low_scores=True)
+        msg = (
+            "Aucune opportunité vraiment intéressante trouvée pour l'instant.\n"
+            f"Deals récupérés : {stats.get('unique_total', 0)}.\n"
+            f"Deals analysés : {stats.get('analyzed_total', 0)}.\n"
+            f"Deals éligibles : {stats.get('eligible_total', 0)}.\n"
+            f"Meilleur score : {stats.get('best_score') if stats.get('best_score') is not None else 'aucun'}."
         )
+        await update.message.reply_text(msg)
+        if SEND_BEST_CANDIDATE_ON_MANUAL_CHECK and candidates:
+            best_deal, best_analysis = candidates[0]
+            await update.message.reply_text("🟡 Meilleur candidat trouvé, mais pas assez fiable/rentable pour alerte automatique :")
+            await send_deal(context.application, update.effective_chat.id, best_deal, best_analysis)
+
+
+async def check_large(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🔎 Scan large lancé : j'envoie jusqu'à 5 meilleurs candidats, même non parfaits...")
+    try:
+        results, stats = scan_detailed(include_low_scores=True)
+        if not results:
+            await update.message.reply_text(
+                "Aucun candidat détecté en mode large.\n"
+                f"Deals récupérés : {stats.get('unique_total', 0)} / analysés : {stats.get('analyzed_total', 0)}"
+            )
+            return
+        await update.message.reply_text(
+            f"{len(results)} candidat(s) détecté(s). J'envoie les {min(5, len(results))} meilleurs.\n"
+            "Attention : certains peuvent être non rentables ou à vérifier."
+        )
+        for deal, analysis in results[:5]:
+            await send_deal(context.application, update.effective_chat.id, deal, analysis)
+    except Exception as exc:
+        log.exception("Erreur check_large")
+        await update.message.reply_text(f"❌ Erreur pendant le scan large : {exc}")
+
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🔎 Diagnostic en cours...")
+    try:
+        _, stats = scan_detailed(include_low_scores=True)
+        await update.message.reply_text(build_debug_message(stats), parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as exc:
+        log.exception("Erreur debug")
+        await update.message.reply_text(f"❌ Erreur diagnostic : {exc}")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -998,6 +1148,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Intervalle scan : {CHECK_INTERVAL_SECONDS} sec\n"
         f"Score minimum alerte : {MIN_SCORE_ALERT}/10\n"
         f"Scan manuel élargi : {MANUAL_INCLUDE_LOW_SCORES}\n"
+        f"Deals incertains : {SEND_UNCERTAIN_DEALS} / score jaune min {MIN_SCORE_UNCERTAIN}\n"
+        f"HTML fallback : {USE_HTML_FALLBACK}\n"
         f"Dernier scan : {state.get('last_scan') or 'aucun'}\n"
         f"Dernière erreur : {state.get('last_error') or 'aucune'}"
     )
@@ -1024,6 +1176,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("start_revente", start_revente))
     application.add_handler(CommandHandler("stop_revente", stop_revente))
     application.add_handler(CommandHandler("check", check))
+    application.add_handler(CommandHandler("check_large", check_large))
+    application.add_handler(CommandHandler("debug", debug_cmd))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("help", help_cmd))
 
