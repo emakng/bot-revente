@@ -16,6 +16,8 @@ Variables d'environnement Render :
 TELEGRAM_TOKEN=xxxx
 CHECK_INTERVAL_SECONDS=300
 MIN_SCORE_ALERT=8
+SEND_UNCERTAIN_DEALS=true
+MIN_SCORE_UNCERTAIN=7
 DEALABS_FEEDS=https://www.dealabs.com/rss/hot,https://www.dealabs.com/rss/new
 DEALABS_SEARCH_QUERIES=jeu PS5,jeux PS5,jeu Switch,DualSense,Joy-Con,manette PS5,casque gaming
 """
@@ -42,7 +44,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.2"
+APP_NAME = "Bot Revente Gaming V1.3"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -57,6 +59,9 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
 # V1.2: prix plus stricts pour éviter les faux positifs Dealabs
 STRICT_PRICE_MODE = os.environ.get("STRICT_PRICE_MODE", "true").lower() == "true"
 USE_HTML_FALLBACK = os.environ.get("USE_HTML_FALLBACK", "false").lower() == "true"
+# V1.3: on envoie aussi certains deals ambigus en alerte jaune, sans inventer de marge.
+SEND_UNCERTAIN_DEALS = os.environ.get("SEND_UNCERTAIN_DEALS", "true").lower() == "true"
+MIN_SCORE_UNCERTAIN = int(os.environ.get("MIN_SCORE_UNCERTAIN", "7"))
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -102,6 +107,8 @@ class Deal:
     temperature: Optional[float] = None
     image: Optional[str] = None
     description: str = ""
+    price_reliable: bool = True
+    uncertainty_reasons: List[str] = None
 
 
 @dataclass
@@ -116,6 +123,7 @@ class Analysis:
     alert_type: str
     format_label: str
     action_label: str
+    price_reliable: bool = True
 
 
 DEFAULT_KEYWORDS = {
@@ -419,6 +427,26 @@ def is_multi_product_or_voucher(title: str) -> bool:
     return any(x in norm for x in suspicious)
 
 
+
+def price_uncertainty_reasons(title: str, body: str = "") -> List[str]:
+    """Repère les deals où le montant Dealabs peut être un exemple, une sélection,
+    un coupon, de la fidélité ou un prix annexe. Ces deals peuvent rester utiles,
+    mais doivent être affichés comme "à vérifier", sans marge inventée.
+    """
+    text = normalize_text(f"{title} {body}")
+    checks = [
+        ("Deal de type sélection / plusieurs produits", ["selection", "sélection", "tous les", "sur tous", "lot de", "plusieurs"]),
+        ("Prix possiblement donné comme exemple", ["ex.:", "ex :", "exemple", "par exemple"]),
+        ("Prix possiblement à partir de", ["a partir de", "à partir de", "dès", "des "]),
+        ("Avantage fidélité/coupon/cashback possible", ["fidelite", "fidélité", "club carrefour", "coupon", "cashback", "odr", "bon d'achat", "bon achat"]),
+        ("Console ou pack trop large à vérifier", ["console nintendo switch", "console switch", "console ps5", "pack console", "bundle console"]),
+    ]
+    reasons: List[str] = []
+    for label, terms in checks:
+        if any(t in text for t in terms):
+            reasons.append(label)
+    return reasons
+
 def extract_price_strict(title: str, body: str = "") -> Tuple[Optional[float], str]:
     """V1.2 : on privilégie le prix présent dans le titre ou un bloc prix isolé.
 
@@ -507,10 +535,12 @@ def fetch_dealabs_feeds() -> List[Deal]:
                 raw_text = f"{title} {summary}"
                 if is_expired_deal_text(raw_text):
                     continue
-                if is_multi_product_or_voucher(title):
-                    continue
-                # V1.2: ne prend pas les montants perdus dans le résumé comme prix produit.
+                # V1.3: on ne supprime plus les sélections : on les déclare incertaines.
+                uncertainty = price_uncertainty_reasons(title, raw_text)
+                price_reliable = not uncertainty
                 price, price_text = extract_price_strict(title, raw_text)
+                if not price_reliable and price is not None:
+                    price_text = f"incertain — montant trouvé : {price_text}"
                 temperature = extract_temperature(raw_text)
                 merchant = detect_merchant(f"{title} {summary}", load_json_file(KEYWORDS_FILE, DEFAULT_KEYWORDS))
                 image = None
@@ -526,6 +556,8 @@ def fetch_dealabs_feeds() -> List[Deal]:
                     temperature=temperature,
                     image=image,
                     description=BeautifulSoup(summary, "html.parser").get_text(" ", strip=True)[:500],
+                    price_reliable=price_reliable,
+                    uncertainty_reasons=uncertainty,
                 ))
         except Exception as exc:
             log.warning("Erreur RSS Dealabs %s: %s", feed_url, exc)
@@ -561,8 +593,8 @@ def parse_deal_card(card: Any, base_url: str = "https://www.dealabs.com") -> Opt
         # Essaie h2/h3
         h = card.find(["h1", "h2", "h3"])
         title = h.get_text(" ", strip=True) if h else text[:120]
-    if is_multi_product_or_voucher(title):
-        return None
+    uncertainty = price_uncertainty_reasons(title, text)
+    price_reliable = not uncertainty
 
     # Essaye d'abord des blocs prix précis, sinon uniquement le titre.
     price_node = None
@@ -576,6 +608,8 @@ def parse_deal_card(card: Any, base_url: str = "https://www.dealabs.com") -> Opt
         price_node = None
     price_source = price_node.get_text(" ", strip=True) if price_node else title
     price, price_text = extract_price_strict(price_source, text)
+    if not price_reliable and price is not None:
+        price_text = f"incertain — montant trouvé : {price_text}"
     temperature = extract_temperature(text)
     keywords = load_json_file(KEYWORDS_FILE, DEFAULT_KEYWORDS)
     merchant = detect_merchant(text, keywords)
@@ -591,6 +625,8 @@ def parse_deal_card(card: Any, base_url: str = "https://www.dealabs.com") -> Opt
         temperature=temperature,
         image=image,
         description=text[:500],
+        price_reliable=price_reliable,
+        uncertainty_reasons=uncertainty,
     )
 
 
@@ -663,14 +699,17 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
     if not category_rule and not urgent:
         return None
 
-    # Pour de la revente, un deal sans prix fiable est inutile et génère trop de faux positifs.
-    if deal.price is None:
+    uncertain_reasons = deal.uncertainty_reasons or []
+
+    # Prix absent : inutile sauf signal urgent ou deal ambigu très ciblé qu'on envoie en jaune.
+    if deal.price is None and not (urgent or (SEND_UNCERTAIN_DEALS and category_rule and uncertain_reasons)):
         return None
 
     # Sécurité anti-faux 0€ : si le prix est 0 mais que le titre ne dit pas clairement
-    # que le produit est gratuit/offert, on ignore. Sinon c'est souvent "livraison gratuite".
+    # que le produit est gratuit/offert, on garde seulement en alerte jaune incertaine.
     if deal.price == 0 and not looks_like_free_product(deal.title):
-        return None
+        uncertain_reasons.append("Prix 0€ probablement lié à livraison/coupon ou montant parasite")
+        deal.price_reliable = False
 
     score_cfg = rules.get("score", {})
     score = 0
@@ -693,6 +732,10 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
     if urgent:
         score += int(score_cfg.get("urgent_bonus", 3))
         reasons.append(f"Signal urgent : {urgent}")
+
+    if uncertain_reasons or not deal.price_reliable:
+        score -= 1
+        reasons.extend(uncertain_reasons[:2])
 
     trusted = any_keyword(norm, keywords.get("trusted_merchants", []))
     if trusted or deal.merchant != "Marchand à vérifier":
@@ -720,7 +763,7 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
     buy_max = category_rule.get("buy_max")
 
     margin_min = margin_max = None
-    if deal.price is not None and resale_min is not None and resale_max is not None:
+    if deal.price is not None and deal.price_reliable and resale_min is not None and resale_max is not None:
         margin_min = round(float(resale_min) - deal.price, 2)
         margin_max = round(float(resale_max) - deal.price, 2)
         if margin_min >= 10:
@@ -735,11 +778,14 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
 
     score = max(0, min(10, score))
 
-    if urgent and score >= 7:
+    if uncertain_reasons or not deal.price_reliable:
+        alert_type = "🟡 DEAL À VÉRIFIER MANUELLEMENT"
+        action_label = "Ouvre le deal : prix réel possiblement différent"
+    elif urgent and score >= 7:
         alert_type = "🚨 URGENT : ERREUR DE PRIX / BUG DE PRIX"
         action_label = "À vérifier immédiatement"
     elif score >= 8:
-        alert_type = "🔥 BON PLAN REVENDABLE"
+        alert_type = "🔥 BON PLAN REVENDABLE FIABLE"
         action_label = "Intéressant si stock et livraison OK"
     else:
         alert_type = "🟡 DEAL À SURVEILLER"
@@ -756,6 +802,7 @@ def analyze_deal(deal: Deal, keywords: Dict[str, Any], rules: Dict[str, Any]) ->
         alert_type=alert_type,
         format_label=str(category_rule.get("format", "à vérifier")),
         action_label=action_label,
+        price_reliable=bool(deal.price_reliable and not uncertain_reasons),
     )
 
 
@@ -774,14 +821,20 @@ def format_range(min_v: Optional[float], max_v: Optional[float]) -> str:
 def build_message(deal: Deal, analysis: Analysis) -> str:
     temp = f"\n🌡️ Température Dealabs : <b>{deal.temperature:.0f}°</b>" if deal.temperature is not None else ""
     reasons = "\n".join(f"• {html.escape(r)}" for r in analysis.reasons)
+    if analysis.price_reliable:
+        price_line = f"💸 Prix détecté : <b>{html.escape(deal.price_text)}</b>\n"
+        margin_line = f"🧮 Marge brute estimée : <b>{html.escape(format_range(analysis.margin_min, analysis.margin_max))}</b>"
+    else:
+        price_line = f"💸 Prix : <b>à vérifier</b>\n💬 Montant repéré : <b>{html.escape(deal.price_text)}</b>\n"
+        margin_line = "🧮 Marge brute estimée : <b>non calculée tant que le prix exact n'est pas confirmé</b>"
     return (
         f"{analysis.alert_type}\n\n"
         f"🎮 Produit : <b>{html.escape(deal.title[:120])}</b>\n"
         f"🏪 Source : <b>{html.escape(deal.merchant)}</b> via Dealabs\n"
-        f"💸 Prix détecté : <b>{html.escape(deal.price_text)}</b>\n"
+        f"{price_line}"
         f"📦 Format : <b>{html.escape(analysis.format_label)}</b>\n"
-        f"📈 Revente estimée Vinted : <b>{html.escape(format_range(analysis.resale_min, analysis.resale_max))}</b>\n"
-        f"🧮 Marge brute estimée : <b>{html.escape(format_range(analysis.margin_min, analysis.margin_max))}</b>"
+        f"📈 Revente habituelle Vinted : <b>{html.escape(format_range(analysis.resale_min, analysis.resale_max))}</b>\n"
+        f"{margin_line}"
         f"{temp}\n\n"
         f"⚠️ Score : <b>{analysis.score}/10</b>\n"
         f"✅ Action : <b>{html.escape(analysis.action_label)}</b>\n\n"
@@ -805,7 +858,7 @@ def scan_once(include_low_scores: bool = False) -> List[Tuple[Deal, Analysis]]:
         analysis = analyze_deal(deal, keywords, rules)
         if not analysis:
             continue
-        if include_low_scores or analysis.score >= MIN_SCORE_ALERT:
+        if include_low_scores or analysis.score >= MIN_SCORE_ALERT or (SEND_UNCERTAIN_DEALS and not analysis.price_reliable and analysis.score >= MIN_SCORE_UNCERTAIN):
             results.append((deal, analysis))
 
     results.sort(key=lambda x: (x[1].score, x[0].temperature or 0), reverse=True)
@@ -867,8 +920,11 @@ async def run_scan_and_alert(application: Application, manual_chat_id: Optional[
     for deal, analysis in results:
         if manual_chat_id is None and deal.id in seen:
             continue
-        if analysis.score < MIN_SCORE_ALERT and not MANUAL_INCLUDE_LOW_SCORES:
-            continue
+        if not MANUAL_INCLUDE_LOW_SCORES:
+            is_uncertain_ok = SEND_UNCERTAIN_DEALS and not analysis.price_reliable and analysis.score >= MIN_SCORE_UNCERTAIN
+            is_reliable_ok = analysis.price_reliable and analysis.score >= MIN_SCORE_ALERT
+            if not (is_reliable_ok or is_uncertain_ok):
+                continue
         new_results.append((deal, analysis))
 
     sent = 0
