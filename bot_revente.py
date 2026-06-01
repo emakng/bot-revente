@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1.7 Prix net réaliste
+Bot Telegram Bons Plans Revente Gaming - V1.8 Récap quotidien
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -24,6 +24,11 @@ SEND_BEST_CANDIDATE_ON_MANUAL_CHECK=true
 CATEGORY_GATE=true
 # V1.7
 PROMO_VALUE_GUARD=true
+# V1.8
+DAILY_SUMMARY_ENABLED=true
+DAILY_SUMMARY_HOUR=20
+DAILY_SUMMARY_MINUTE=30
+DAILY_SUMMARY_TIMEZONE=Europe/Paris
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus, urljoin
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -48,7 +54,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.7"
+APP_NAME = "Bot Revente Gaming V1.8"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -76,6 +82,13 @@ CATEGORY_GATE = os.environ.get("CATEGORY_GATE", "true").lower() == "true"
 # avec le vrai prix payé. Ces deals restent visibles en jaune, sans marge inventée.
 PROMO_VALUE_GUARD = os.environ.get("PROMO_VALUE_GUARD", "true").lower() == "true"
 CONDITIONAL_PRICE_PENALTY = int(os.environ.get("CONDITIONAL_PRICE_PENALTY", "2"))
+
+# V1.8 : résumé quotidien pour savoir que le bot travaille même sans alerte.
+DAILY_SUMMARY_ENABLED = os.environ.get("DAILY_SUMMARY_ENABLED", "true").lower() == "true"
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "20"))
+DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "30"))
+DAILY_SUMMARY_TIMEZONE = os.environ.get("DAILY_SUMMARY_TIMEZONE", "Europe/Paris")
+DAILY_SUMMARY_TOP_N = int(os.environ.get("DAILY_SUMMARY_TOP_N", "3"))
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -354,10 +367,12 @@ def load_state() -> Dict[str, Any]:
                 state.setdefault("seen_deals", [])
                 state.setdefault("last_scan", None)
                 state.setdefault("last_error", None)
+                state.setdefault("last_daily_summary_date", None)
+                state.setdefault("last_daily_summary", None)
                 return state
         except Exception as exc:
             log.warning("Impossible de lire l'état: %s", exc)
-    return {"subscribers": [], "seen_deals": [], "last_scan": None, "last_error": None}
+    return {"subscribers": [], "seen_deals": [], "last_scan": None, "last_error": None, "last_daily_summary_date": None, "last_daily_summary": None}
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -1150,12 +1165,93 @@ async def run_scan_and_alert(application: Application, manual_chat_id: Optional[
     return len(results), sent
 
 
+
+def get_summary_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo(DAILY_SUMMARY_TIMEZONE))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def should_send_daily_summary(state: Dict[str, Any]) -> bool:
+    if not DAILY_SUMMARY_ENABLED:
+        return False
+    now = get_summary_now()
+    if now.hour < DAILY_SUMMARY_HOUR or (now.hour == DAILY_SUMMARY_HOUR and now.minute < DAILY_SUMMARY_MINUTE):
+        return False
+    today_key = now.date().isoformat()
+    return state.get("last_daily_summary_date") != today_key
+
+
+def build_daily_summary_message(stats: Dict[str, Any], candidates: List[Tuple[Deal, Analysis]]) -> str:
+    now = get_summary_now()
+    lines = [
+        f"📊 <b>Récap Bot Revente — {now.strftime('%d/%m %H:%M')}</b>",
+        "",
+        f"Deals récupérés : <b>{stats.get('unique_total', 0)}</b>",
+        f"Deals gaming analysés : <b>{stats.get('analyzed_total', 0)}</b>",
+        f"Alertes fiables détectées : <b>{stats.get('reliable_alerts', 0)}</b>",
+        f"Alertes jaunes détectées : <b>{stats.get('uncertain_alerts', 0)}</b>",
+        f"Prix incertains repérés : <b>{stats.get('uncertain_price', 0)}</b>",
+        "",
+    ]
+    if candidates:
+        lines.append(f"🏆 <b>Top {min(DAILY_SUMMARY_TOP_N, len(candidates))} candidats du moment</b>")
+        for i, (deal, analysis) in enumerate(candidates[:DAILY_SUMMARY_TOP_N], start=1):
+            title = html.escape(deal.title[:95] + ("…" if len(deal.title) > 95 else ""))
+            price = "à vérifier" if not analysis.price_reliable else (format_price(deal.price) if deal.price is not None else "non détecté")
+            margin = "non calculée" if analysis.margin_min is None else f"{format_price(analysis.margin_min)} – {format_price(analysis.margin_max)}"
+            lines.append(f"{i}. <b>{title}</b>")
+            lines.append(f"   Score : <b>{analysis.score}/10</b> | Prix : <b>{html.escape(price)}</b> | Marge : <b>{html.escape(margin)}</b>")
+    else:
+        lines.append("Aucun candidat gaming intéressant trouvé aujourd’hui.")
+    lines.extend([
+        "",
+        "✅ Bot actif. Pas d’alerte = aucun deal assez rentable selon les seuils actuels.",
+        "Utilise /check_large pour voir les candidats détaillés."
+    ])
+    return "\n".join(lines)
+
+
+async def send_daily_summary(application: Application) -> None:
+    state = load_state()
+    subscribers = state.get("subscribers", [])
+    if not subscribers:
+        return
+    try:
+        candidates, stats = scan_detailed(include_low_scores=True)
+        message = build_daily_summary_message(stats, candidates)
+        for chat_id in subscribers:
+            try:
+                await application.bot.send_message(
+                    chat_id=int(chat_id),
+                    text=message,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:
+                log.warning("Erreur envoi résumé quotidien chat %s: %s", chat_id, exc)
+        now = get_summary_now()
+        state["last_daily_summary_date"] = now.date().isoformat()
+        state["last_daily_summary"] = now.isoformat()
+        state["last_scan"] = datetime.now(timezone.utc).isoformat()
+        state["last_error"] = stats.get("last_error")
+        save_state(state)
+        log.info("Résumé quotidien envoyé à %s abonné(s)", len(subscribers))
+    except Exception as exc:
+        log.exception("Erreur résumé quotidien")
+        state["last_error"] = f"Résumé quotidien: {exc}"
+        save_state(state)
+
 async def scanner_loop(application: Application) -> None:
     while True:
         state = load_state()
         if state.get("subscribers"):
             total, sent = await run_scan_and_alert(application)
             log.info("Scan automatique terminé: %s deals filtrés, %s alertes envoyées", total, sent)
+            refreshed_state = load_state()
+            if should_send_daily_summary(refreshed_state):
+                await send_daily_summary(application)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
@@ -1235,6 +1331,20 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Erreur diagnostic : {exc}")
 
 
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("📊 Récap manuel en cours...")
+    try:
+        candidates, stats = scan_detailed(include_low_scores=True)
+        await update.message.reply_text(
+            build_daily_summary_message(stats, candidates),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        log.exception("Erreur summary")
+        await update.message.reply_text(f"❌ Erreur pendant le récap : {exc}")
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     await update.message.reply_text(
@@ -1247,6 +1357,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Deals incertains : {SEND_UNCERTAIN_DEALS} / score jaune min {MIN_SCORE_UNCERTAIN}\n"
         f"HTML fallback : {USE_HTML_FALLBACK}\n"
         f"Dernier scan : {state.get('last_scan') or 'aucun'}\n"
+        f"Résumé quotidien : {DAILY_SUMMARY_ENABLED} à {DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d} ({DAILY_SUMMARY_TIMEZONE})\n"
+        f"Dernier récap : {state.get('last_daily_summary') or 'aucun'}\n"
         f"Dernière erreur : {state.get('last_error') or 'aucune'}"
     )
 
@@ -1257,8 +1369,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start_revente — activer les alertes\n"
         "/check — scanner maintenant\n"
         "/status — voir l'état\n"
+        "/summary — récap manuel\n"
         "/stop_revente — arrêter les alertes\n\n"
-        "V1.5 = Dealabs uniquement avec filtre catégorie obligatoire. Keepa/Amazon et Vinted pourront être ajoutés ensuite."
+        "V1.8 = Dealabs avec filtre catégorie, protection prix promo, debug et récap quotidien."
     )
 
 
@@ -1275,6 +1388,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("check_large", check_large))
     application.add_handler(CommandHandler("debug", debug_cmd))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("summary", summary_cmd))
+    application.add_handler(CommandHandler("recap", summary_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
 
     asyncio.create_task(scanner_loop(application))
