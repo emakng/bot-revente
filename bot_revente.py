@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1.8.1 Récap quotidien
+Bot Telegram Bons Plans Revente Gaming - V1.8.2 Récap anti-blocage
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -29,6 +29,8 @@ DAILY_SUMMARY_ENABLED=true
 DAILY_SUMMARY_HOUR=20
 DAILY_SUMMARY_MINUTE=30
 DAILY_SUMMARY_TIMEZONE=Europe/Paris
+SUMMARY_TIMEOUT_SECONDS=60
+DEALABS_HTML_MAX_URLS=10
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.8.1"
+APP_NAME = "Bot Revente Gaming V1.8.2"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -89,6 +91,9 @@ DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "20"))
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "30"))
 DAILY_SUMMARY_TIMEZONE = os.environ.get("DAILY_SUMMARY_TIMEZONE", "Europe/Paris")
 DAILY_SUMMARY_TOP_N = int(os.environ.get("DAILY_SUMMARY_TOP_N", "3"))
+# V1.8.2 : évite que /summary reste bloqué trop longtemps si Dealabs/Render est lent.
+SUMMARY_TIMEOUT_SECONDS = int(os.environ.get("SUMMARY_TIMEOUT_SECONDS", "60"))
+DEALABS_HTML_MAX_URLS = int(os.environ.get("DEALABS_HTML_MAX_URLS", "10"))
 
 DEFAULT_DEALABS_FEEDS = [
     "https://www.dealabs.com/rss/hot",
@@ -729,7 +734,7 @@ def fetch_dealabs_search_pages() -> List[Deal]:
     urls = ["https://www.dealabs.com/groupe/jeux-video", "https://www.dealabs.com/hot"]
     urls += [f"https://www.dealabs.com/search?q={quote_plus(q)}" for q in queries]
 
-    for url in urls[:20]:
+    for url in urls[:DEALABS_HTML_MAX_URLS]:
         try:
             resp = session.get(url, timeout=HTTP_TIMEOUT)
             if resp.status_code >= 400:
@@ -1068,7 +1073,8 @@ def build_debug_message(stats: Dict[str, Any]) -> str:
         f"<b>Sources RSS :</b>\n{feeds_text}\n"
         f"HTML fallback : <b>{USE_HTML_FALLBACK}</b>\n"
         f"Mode prix strict : <b>{STRICT_PRICE_MODE}</b>\n"
-        f"Protection chèques/cashback/nouveaux clients : <b>{PROMO_VALUE_GUARD}</b>\n\n"
+        f"Protection chèques/cashback/nouveaux clients : <b>{PROMO_VALUE_GUARD}</b>\n"
+        f"Limite pages HTML : <b>{DEALABS_HTML_MAX_URLS}</b> | Timeout récap : <b>{SUMMARY_TIMEOUT_SECONDS}s</b>\n\n"
         f"Deals RSS récupérés : <b>{stats.get('raw_from_rss', 0)}</b>\n"
         f"Deals HTML récupérés : <b>{stats.get('raw_from_html', 0)}</b>\n"
         f"Deals bruts : <b>{stats.get('raw_total', 0)}</b>\n"
@@ -1230,7 +1236,10 @@ async def send_daily_summary(application: Application) -> None:
     if not subscribers:
         return
     try:
-        candidates, stats = scan_detailed(include_low_scores=True)
+        candidates, stats = await asyncio.wait_for(
+            asyncio.to_thread(scan_detailed, True),
+            timeout=SUMMARY_TIMEOUT_SECONDS,
+        )
         message = build_daily_summary_message(stats, candidates)
         for chat_id in subscribers:
             try:
@@ -1249,6 +1258,10 @@ async def send_daily_summary(application: Application) -> None:
         state["last_error"] = stats.get("last_error")
         save_state(state)
         log.info("Résumé quotidien envoyé à %s abonné(s)", len(subscribers))
+    except asyncio.TimeoutError:
+        log.warning("Résumé quotidien interrompu: timeout %ss", SUMMARY_TIMEOUT_SECONDS)
+        state["last_error"] = f"Résumé quotidien trop long: timeout {SUMMARY_TIMEOUT_SECONDS}s"
+        save_state(state)
     except Exception as exc:
         log.exception("Erreur résumé quotidien")
         state["last_error"] = f"Résumé quotidien: {exc}"
@@ -1345,11 +1358,19 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("📊 Récap manuel en cours...")
     try:
-        candidates, stats = scan_detailed(include_low_scores=True)
+        candidates, stats = await asyncio.wait_for(
+            asyncio.to_thread(scan_detailed, True),
+            timeout=SUMMARY_TIMEOUT_SECONDS,
+        )
         await update.message.reply_text(
             build_daily_summary_message(stats, candidates),
             parse_mode="HTML",
             disable_web_page_preview=True,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            f"⏱️ Le récap a pris plus de {SUMMARY_TIMEOUT_SECONDS} secondes. Je l’ai arrêté pour éviter de bloquer le bot.\n"
+            "Baisse DEALABS_HTML_MAX_URLS à 6 ou 8, ou relance /summary dans quelques minutes."
         )
     except Exception as exc:
         log.exception("Erreur summary")
