@@ -1,5 +1,5 @@
 """
-Bot Telegram Bons Plans Revente Gaming - V1.8 Récap quotidien
+Bot Telegram Bons Plans Revente Gaming - V1.8.1 Récap quotidien
 ---------------------------------------------------
 Objectif : surveiller Dealabs pour trouver des bons plans revendables
 sur Vinted/Leboncoin : jeux PS5 physiques, jeux Switch physiques,
@@ -54,7 +54,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-APP_NAME = "Bot Revente Gaming V1.8"
+APP_NAME = "Bot Revente Gaming V1.8.1"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 STATE_FILE = DATA_DIR / "revente_state.json"
 KEYWORDS_FILE = Path(os.environ.get("KEYWORDS_FILE", "config_keywords.json"))
@@ -1181,6 +1181,17 @@ def should_send_daily_summary(state: Dict[str, Any]) -> bool:
         return False
     today_key = now.date().isoformat()
     return state.get("last_daily_summary_date") != today_key
+
+
+
+def format_price(value: Optional[float]) -> str:
+    """Formate un prix en euros pour les messages Telegram."""
+    if value is None:
+        return "à vérifier"
+    try:
+        return f"{float(value):.2f} €".replace(".", ",")
+    except (TypeError, ValueError):
+        return "à vérifier"
 
 
 def build_daily_summary_message(stats: Dict[str, Any], candidates: List[Tuple[Deal, Analysis]]) -> str:
